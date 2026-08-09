@@ -595,13 +595,22 @@ func (s *Server) halfOpenReaperLoop() {
 			if sa == nil {
 				continue
 			}
+			// Check the timeout and transition to ikeStateDeleting atomically
+			// with respect to sa.mu: holding the lock across fullTeardown (same
+			// pattern as the DPD path in reaperLoop below) closes the race where
+			// authentication completes concurrently with expiry. Once the state
+			// flips to ikeStateDeleting inside this critical section, handleIKEAuth's
+			// `sa.state != ikeStateAuth` guard rejects any in-flight IKE_AUTH for
+			// this SA; conversely, if IKE_AUTH already promoted the SA to
+			// ikeStateEstablished before we got the lock, shouldExpire is false and
+			// we leave it alone.
 			sa.mu.Lock()
-			shouldExpire := sa.state == ikeStateAuth && time.Since(sa.createdAt) > timeout
-			sa.mu.Unlock()
-			if shouldExpire {
-				s.deleteSA(spiI)
+			if sa.state == ikeStateAuth && time.Since(sa.createdAt) > timeout {
+				sa.state = ikeStateDeleting
+				s.fullTeardown(sa, "half_open_timeout")
 				expired++
 			}
+			sa.mu.Unlock()
 		}
 		if expired > 0 {
 			s.log.Info("IKEv2: expired half-open IKE SAs", "count", expired, "timeout", timeout)
